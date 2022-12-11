@@ -1,0 +1,32 @@
+node {
+
+	checkout scm
+
+    catchError {
+		stage('build') {
+			mvn('-U clean package -Dmaven.javadoc.skip=true')
+		}
+		stage('deploy') {
+			if (isGitBranch('develop') || isGitBranch('master')) {
+				mvn('-U deploy -Dmaven.javadoc.skip=true -Dbuild.number=${GIT_BRANCH}-#${BUILD_NUMBER}')
+			}
+		}
+		currentBuild.result = 'SUCCESS'
+	}
+	step([$class: 'Mailer', notifyEveryUnstableBuild: true, recipients: 'entwicklermobile@fone.com', sendToIndividuals: true])
+}
+
+def isGitBranch(branchName) {
+	return env.BRANCH_NAME==branchName
+}
+
+def mvn(mvnOptions) {
+	withMaven(jdk: 'jdk8', maven: 'mvn-325', mavenSettingsConfig: 'paps-maven-settings') {
+   		if(isUnix()) {
+			sh 'mvn ' + mvnOptions
+		}
+		else {
+			bat 'mvn ' + mvnOptions
+		}
+	}
+}
