@@ -1,0 +1,189 @@
+#!groovy
+import java.security.MessageDigest
+import java.time.LocalDate
+import java.time.LocalDateTime
+
+def triggers = [pollSCM('H/5 * * * *')]
+if (env.BRANCH_NAME == 'develop') {
+    def cronTimer = 'H(10-15) 03 * * 1-5\n' // 03:10am - 03:15am
+    triggers.add(cron(cronTimer))
+}
+
+properties([
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '7', numToKeepStr: '10')),
+        pipelineTriggers(triggers),
+        disableConcurrentBuilds()
+])
+
+def formattedDate = new Date().format('yyyyMMddHHmmss')
+def gradleCmd = "./gradlew -PformattedDate=${formattedDate} --no-daemon"
+def dbUserAndPassword = generateDbUserName(env.BRANCH_NAME, env.BUILD_NUMBER)
+
+node {
+    try {
+        checkout scm
+        sh 'git clean -fdx'
+
+        stage('Build, Small and Medium Tests') {
+            try {
+                sh "${gradleCmd} --continue --stacktrace --info clean build buildRpm"
+            } finally {
+                archiveTestResults("**/build/**/TEST-*.xml")
+                archiveArtifacts allowEmptyArchive: true, artifacts: '**/build/reports/**'
+            }
+        }
+
+        lock("largeTests-${env.NODE_NAME}") {
+            stage('Liquibase Script Test') {
+                sh "${gradleCmd} --continue -PdbUser=${dbUserAndPassword} -PdbPassword=${dbUserAndPassword} brand-db-scripts:createOracleUser"
+                //sh "${gradleCmd} --continue brand-db-scripts:dropAll"
+                sh "${gradleCmd} --continue -PdbUser=${dbUserAndPassword} -PdbPassword=${dbUserAndPassword} brand-db-scripts:createSqlDump"
+                sh "${gradleCmd} --continue -PdbUser=${dbUserAndPassword} -PdbPassword=${dbUserAndPassword} brand-db-scripts:executeSqlDump"
+            }
+
+            stage('Large Tests') {
+                try {
+                    sh "${gradleCmd} -Dspring.profiles.active=integration-test-oracle-db -Ddatasource.brandserver.username=${dbUserAndPassword} -Ddatasource.brandserver.password=${dbUserAndPassword} acceptanceTests"
+                } finally {
+                    archiveTestResults("**/build/**/TEST-*.xml")
+                    sh "${gradleCmd} --continue -PdbUser=${dbUserAndPassword} -PdbPassword=${dbUserAndPassword} brand-db-scripts:dropOracleUser"
+                }
+            }
+        }
+
+        stage('Code Quality Reports') {
+            archiveTestResults("**/build/**/TEST-*.xml")
+            sh "${gradleCmd} jacocoTestReport"
+            step([$class: 'JacocoPublisher', classPattern: '**/build/classes', exclusionPattern: '**/*SelmaGeneratedClass*'])
+
+        }
+
+        stage('Load Tests') {
+            if (isJobStartedByTimer()) {
+                lock("performanceTests-${env.NODE_NAME}") {
+                    dir('server') {
+                        try {
+                            sh "echo \"../${gradleCmd} -Dspring.profiles.active=load-test bootLoadTest\" | at now"
+                            sleep 30
+                            sh "../${gradleCmd} loadTests"
+                        } finally {
+                            sh "test -f build/brand-server.pid && xargs kill -15 < build/brand-server.pid || echo 'App was not running, nothing to stop'"
+                            sleep 10
+                            gatlingArchive()
+                            archiveArtifacts allowEmptyArchive: true, artifacts: 'build/reports/gatling/**'
+                            archiveArtifacts allowEmptyArchive: true, artifacts: 'build/loadTest.jfr'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Stress Tests') {
+            if (false) { // isJobStartedByTimer()
+                lock("performanceTests-${env.NODE_NAME}") {
+                    dir('server') {
+                        try {
+                            sh "echo \"../${gradleCmd} -Dspring.profiles.active=load-test bootStressTest\" | at now"
+                            sleep 30
+                            sh "../${gradleCmd} stressTests"
+                            emailext(
+                                    subject: "Finished stress test: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                                    body: """<p>Stress test: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+                                    <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${
+                                        env.BUILD_NUMBER
+                                    }]</a>&QUOT;</p>""",
+                                    recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+                            )
+                        } finally {
+                            sh "test -f build/brand-server.pid && xargs kill -15 < build/brand-server.pid || echo 'App was not running, nothing to stop'"
+                            sleep 10
+                            gatlingArchive()
+                            archiveArtifacts allowEmptyArchive: true, artifacts: 'build/reports/gatling/**'
+                            archiveArtifacts allowEmptyArchive: true, artifacts: 'build/stressTest.jfr'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Mutation Tests') {
+            if (isJobStartedByTimer()) {
+                lock("mutationTests-${env.NODE_NAME}") {
+                    try {
+                        sh "${gradleCmd} pitest"
+                    } finally {
+                        archiveArtifacts allowEmptyArchive: true, artifacts: '**/build/reports/pitest/**'
+                    }
+                }
+            }
+        }
+
+        stage('Documentation') {
+            sh "${gradleCmd} asciidoctor"
+        }
+
+        stage('Publish') {
+            sh "${gradleCmd} publish"
+        }
+
+        if (env.BRANCH_NAME == 'release' || env.BRANCH_NAME =~ 'hotfix-.*') {
+            stage('Promote') {
+                sh "${gradleCmd} -PpublishingTarget=release publish"
+            }
+        }
+
+        if (env.BRANCH_NAME == 'develop') {
+            stage('Deploy') {
+                if (isJobStartedByTimer()) {
+                    def version = readFile "ansible-playbooks/build/version.txt"
+                    sh "echo ${version}"
+                    sh "ansible-playbook -u iss_ansible_deploy -i ansible-playbooks/src/main/resources/inventories/dev" +
+                            " --extra-vars 'rpm_version=${version}'" +
+                            " ansible-playbooks/src/main/resources/books/deploy_brandserver.yml"
+                }
+            }
+        }
+
+    } catch (e) {
+        notifyFailed()
+        throw e
+    } finally {
+        sh "${gradleCmd} --continue -PdbUser=${dbUserAndPassword} -PdbPassword=${dbUserAndPassword} brand-db-scripts:dropOracleUser"
+    }
+}
+
+def archiveTestResults(filePattern) {
+    junit keepLongStdio: true, testResults: filePattern
+}
+
+def notifyFailed() {
+    final RECIPIENTS = emailextrecipients([
+            [$class: 'DevelopersRecipientProvider'],
+            [$class: 'CulpritsRecipientProvider'],
+            [$class: 'RequesterRecipientProvider']
+    ])
+    final SUBJECT = "FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+    final CONTENT = """<p>FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+                        <p>Check console output at "<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>"</p>"""
+
+    mail to: RECIPIENTS, subject: SUBJECT, body: CONTENT, mimeType: "text/html"
+}
+
+def isJobStartedByTimer() {
+    def today = LocalDate.now()
+    def startTime = today.minusDays(1).atTime(22, 00) // day before
+    def endTime = today.atTime(06, 00)
+
+    def currentTime = LocalDateTime.now()
+    return env.BRANCH_NAME == 'develop' && startTime.isBefore(currentTime) && endTime.isAfter(currentTime)
+}
+
+def generateMd5(String s) {
+    return MessageDigest.getInstance("MD5").digest(s.bytes).encodeHex().toString()
+}
+
+def generateDbUserName(branchName, buildNumber) {
+    def uniqueName = "${branchName}-${buildNumber}"
+    def md5 = generateMd5(uniqueName)
+    return "bs_user_${md5.take(22)}" // 30 chars max for Oracle db
+}

@@ -1,0 +1,209 @@
+apply plugin: 'bs-code-generator'
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'info.solidsoft.gradle.pitest:gradle-pitest-plugin:1.1.11'
+    }
+}
+
+allprojects {
+    apply plugin: 'idea'
+    idea {
+        module {
+            outputDir file('build/classes/main')
+            testOutputDir file('build/classes/test')
+        }
+    }
+    if(project.convention.findPlugin(JavaPluginConvention)) {
+        // Change the output directory for the main and test source sets back to the old path
+        sourceSets.main.output.classesDir = new File(buildDir, "classes/main")
+        sourceSets.test.output.classesDir = new File(buildDir, "classes/test")
+    }
+}
+
+def checkstyleConfigFile = new File(rootDir, 'config/checkstyle/checkstyle.xml')
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'maven-publish'
+    apply plugin: 'jacoco'
+    apply plugin: 'checkstyle'
+    apply plugin: 'findbugs'
+
+    ext {
+        revision = getCommitId()
+        formattedDate = project.hasProperty('formattedDate') ? project.formattedDate : new Date().format('yyyyMMddHHmm') + '00'
+        h2Version = '1.4.192'
+        springBootVersion = '1.5.9.RELEASE'
+        pivotalSpringCloudVersion = '1.5.0.RELEASE'
+        brandAPIsVersion = '3.5.3-20180227164956_e70fd9c'
+    }
+
+    group = 'com.ubs.brand'
+    version = "6.14.0-RC2-${formattedDate}_${revision}"
+
+    checkstyle {
+        sourceSets = [project.sourceSets.main]
+        toolVersion ="8.5"
+    }
+
+    checkstyleMain {
+        configFile = checkstyleConfigFile
+    }
+    checkstyleTest {
+        configFile = checkstyleConfigFile
+    }
+
+    tasks.withType(FindBugs) {
+        reports {
+            xml.enabled false
+            html.enabled true
+        }
+        // excludeFilter file("${projectDir}/../config/findbug/exclude-filter.xml")
+    }
+
+    findbugs {
+        sourceSets = [sourceSets.main]
+        effort = "max"
+    }
+
+    repositories {
+        mavenLocal()
+        maven {
+            url 'http://d-issrepo-app01.ubs.sys:8081/nexus/content/groups/public'
+        }
+        maven { url 'http://q-issrepo-app01.ubs.sys:8081/nexus/content/groups/public' }
+        maven { url 'http://q-issrepo-app01.ubs.sys:8081/nexus/content/repositories/iss-app-rpms' }
+        mavenCentral()
+        maven { url "http://repo.spring.io/snapshot" }
+        maven { url "http://repo.spring.io/milestone" }
+        maven { url "http://repo.spring.io/release" }
+    }
+
+    tasks.withType(JavaCompile) {
+        options.compilerArgs << "-Xlint:unchecked" << "-Xlint:deprecation"
+    }
+
+    task sourceJar(type: Jar) {
+        from sourceSets.main.allJava
+    }
+
+    task javadocJar(type: Jar, dependsOn: javadoc) {
+        classifier = 'javadoc'
+        from javadoc.destinationDir
+    }
+
+    jacocoTestReport {
+        group = "report"
+        reports {
+            xml.enabled false
+            csv.enabled false
+            html.destination "${buildDir}/reports/coverage"
+        }
+
+        afterEvaluate {
+            classDirectories = files(classDirectories.files.collect {
+                fileTree(dir: it, exclude: [
+                        '**/*SelmaGeneratedClass**'
+                ])
+            })
+        }
+    }
+    test.finalizedBy(project.tasks.jacocoTestReport)
+
+    jacocoTestCoverageVerification {
+        violationRules {
+            rule {
+                limit {
+                    minimum = 0.8
+                }
+            }
+        }
+    }
+
+    test {
+        useJUnit {
+            excludeCategories('com.ubs.brand.test.LargeTest', 'com.ubs.brand.test.DocGenerationTest')
+        }
+        reports.junitXml.destination = "$buildDir/test-results/small-tests"
+    }
+
+    task acceptanceTests(type: Test) {
+        group = 'verification'
+        useJUnit {
+            includeCategories('com.ubs.brand.test.LargeTest')
+        }
+        reports.junitXml.destination = "$buildDir/test-results/large-tests"
+        systemProperty "spring.profiles.active", System.properties.getProperty("spring.profiles.active")
+        systemProperty "datasource.brandserver.username", System.properties.getProperty("datasource.brandserver.username")
+        systemProperty "datasource.brandserver.password", System.properties.getProperty("datasource.brandserver.password")
+    }
+
+    dependencies {
+        testCompile project(':brand-test-support')
+    }
+
+    publishing {
+        repositories {
+            maven {
+                name 'jar'
+                credentials {
+                    username "acmng"
+                    password "acmng"
+                }
+                if (project.hasProperty('publishingTarget') && publishingTarget == 'release') {
+                    url 'http://q-issrepo-app01.ubs.sys:8081/nexus/content/repositories/releases'
+                } else {
+                    url 'http://d-issrepo-app01.ubs.sys:8081/nexus/content/repositories/releases'
+                }
+            }
+            maven {
+                name 'rpm'
+                credentials {
+                    username 'acmng'
+                    password 'acmng'
+                }
+                if (project.hasProperty('publishingTarget') && publishingTarget == 'release') {
+                    url 'http://q-issrepo-app01.ubs.sys:8081/nexus/content/repositories/iss-app-rpms'
+                } else {
+                    url 'http://d-issrepo-app01.ubs.sys:8081/nexus/content/repositories/iss-app-rpms'
+                }
+            }
+        }
+    }
+
+    afterEvaluate {
+        tasks.withType(PublishToMavenRepository) { task ->
+            if (task.publication.hasProperty('type') && task.publication.type != task.repository.name) {
+                task.enabled = false
+                task.group = null
+            }
+        }
+    }
+
+}
+
+configure(subprojects - project(':brand-integration-tests')) {
+    dependencies {
+        testCompile 'junit:junit:4.12'
+    }
+}
+
+project(':brand-integration-tests') {
+    dependencies {
+        testCompile 'junit:junit-dep:4.10'
+    }
+}
+
+def getCommitId() {
+    def output = new ByteArrayOutputStream()
+    exec {
+        commandLine 'git', 'rev-parse', '--short', 'HEAD'
+        standardOutput = output
+    }
+
+    return output.toString().trim()
+}

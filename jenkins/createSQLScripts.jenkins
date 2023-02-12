@@ -1,0 +1,72 @@
+#!groovy
+
+def archiveFile = 'build/script.tar'
+def sqlFile = 'build/script.sql'
+
+def create_synonyms = 'db-scripts/src/main/resources/tools/create_synonyms.sql'
+def grant_object_permissions = 'db-scripts/src/main/resources/tools/grant_object_permissions.sql'
+
+node {
+    parameters {
+        string(name: 'oldVersion', description: 'Which version was the last one?')
+        string(name: 'newVersion', description: 'Which version is the new one?')
+    }
+
+    checkout scm
+
+    stage('Reset Database') {
+        echo 'Run SQL reset scripts'
+
+        runDBTasks('dropOracleUser')
+        runDBTasks('createOracleUser')
+    }
+
+    stage('Checkout old version') {
+        checkout([
+            $class: 'GitSCM',
+            branches: [[name: "refs/tags/${params.oldVersion}"]]
+        ])
+    }
+
+    stage('Apply liquibase') {
+        runDBTasks('runLiquibaseUpdate')
+    }
+
+    stage('Checkout new version') {
+        checkout([
+            $class: 'GitSCM',
+            branches: [[name: "refs/tags/${params.newVersion}"]]
+        ])
+    }
+
+    stage('Create SQL script') {
+        runDBTasks("-PdbSqlFile=${sqlFile}.tmp brand-db-scripts:createSqlDump")
+    }
+
+    stage('Adjust SQL script') {
+        sh "echo \"alter session set current_schema = BRAND_SERVER_DATA;\n\" > ${sqlFile}"
+        sh "cat ${sqlFile}.tmp | sed s\\/db-scripts\\\\/src\\\\/main\\\\/resources\\\\/db\\\\/changelog\\/" +
+                "\\\\/var\\\\/lib\\\\/issuing\\\\/liquibase\\\\/brand-server\\/ >> ${sqlFile}"
+    }
+
+    // TODO
+    // Did not work because tar also creates the folders inside the archive but not a flat file structure
+    /*
+    stage('Create package') {
+        sh "tar -acf --strip ${archiveFile} ${sqlFile} ${create_synonyms} ${grant_object_permissions}"
+        archiveArtifacts artifacts: "${archiveFile}", fingerprint: true
+    }
+    */
+
+    archiveArtifacts artifacts: sqlFile, fingerprint: true
+}
+
+def runDBTasks(String name) {
+    def formattedDate = new Date().format('yyyyMMddHHmmss')
+    def gradleCmd = "./gradlew -PformattedDate=${formattedDate} --no-daemon"
+
+    def sqlUser = 'BRAND_SERVER_DATA'
+    def sqlHost = 'd-xd01-scan.ubs.sys:1521/BUILD.UBS'
+
+    sh "${gradleCmd} -PdbUser=${sqlUser} -PdbPassword=${sqlUser} -PdbHost=${sqlHost} ${name}"
+}
